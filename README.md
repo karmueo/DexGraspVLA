@@ -1,191 +1,205 @@
-<h1 align="center"> DexGraspVLA: A Vision-Language-Action Framework Towards General Dexterous Grasping </h1>
+## RM75 单臂夹爪训练
 
+本节说明如何把 `data/org_data/0/episode_*` 形式的演示数据转换为训练数据，并完成 RM75 单臂夹爪策略的配置、训练和检查。以下命令均在项目根目录执行。模型使用一帧夹爪相机 RGB 图像及目标 mask（`rgbm: 1×4×294×518`）、7 维关节加 1 维夹爪状态（`right_state: 1×8`），预测 64 步、每步 8 维的动作。
 
-### 📝 [Paper](https://arxiv.org/abs/2502.20900) | 🌍 [Project Page](https://dexgraspvla.github.io/) | 📺 [Video](https://www.youtube.com/watch?v=ucm3I2iHHaI)
+### 1. 准备环境与权重
 
-
-![](./assets/teaser.jpg)
-
-
-**DexGraspVLA** is a **hierarchical vision-language-action framework** that reaches a **90+\%** success rate in **dexterous grasping in cluttered scenes** under **thousands** of **unseen** object, lighting, and background combinations in a "**zero-shot**" real-world environment. It robustly handles **adversarial objects**, **human disturbance**, and **failure recovery**, and can complete **long-horizon grasping tasks** that require **complex vision-language reasoning**. The framework utilizes a pre-trained vision-language model as the high-level task planner and learns a diffusion-based policy as the low-level action controller. Its key insight lies in leveraging foundation models for strong generalization and using diffusion-based imitation learning for acquiring dexterous actions.
-
-
-
-![](./assets/method.jpg)
-
-# Environment Setup
-
-First, please create and activate the conda environment:
-```bash
-conda create -n dexgraspvla python=3.9
-conda activate dexgraspvla
-git clone https://github.com/Psi-Robot/DexGraspVLA.git
-cd DexGraspVLA
-pip install -r requirements.txt
-```
-
-Then, please install [SAM](https://github.com/facebookresearch/segment-anything) and [Cutie](https://github.com/hkchengrex/Cutie) following the official instructions.
-
-The CUDA version we use is 12.6.
-
-# DexGraspVLA Controller
-
-## Prepare Dataset
-
-We provide a tiny [dataset](https://drive.google.com/file/d/1Z4QIibZwudz_qUazAGQAF7lAFAoRROnK/view?usp=drive_link) containing 51 human demonstration data samples, allowing users to understand the content and format of our data, as well as run the code to get a hands-on experience of the training process. 
-
-First, create a `data` folder under the repo root:
+先安装 `uv`，再创建独立的 Python 3.10 环境。安装脚本使用锁定依赖和 PyTorch 2.7.1 / CUDA 12.8，安装 Cutie v1.0 源码，并执行 CUDA、BF16 和关键模块检查：
 
 ```bash
-[DexGraspVLA]$ mkdir data && cd data
+bash scripts/setup_rm75_env.sh
+uv run --no-project --python .venv-rm75/bin/python scripts/check_rm75_env.py
 ```
 
-Download the dataset and put it in the `data` folder. Then, decompress the dataset:
+默认环境位于 `.venv-rm75/`。后续命令使用 `uv run --no-project --python .venv-rm75/bin/python` 指定该环境；`--no-project` 避免启动时按其他项目配置重新同步依赖。已有 Cutie v1.0 源码时，可在执行安装脚本前设置 `RM75_CUTIE_SOURCE=/path/to/Cutie`。
+
+权重放在项目根目录的 `weights/`，该目录不由 Git 跟踪。RM75 训练需要 DINOv2 ViT-B/14；生成 mask 需要 Cutie base mega。分别从 [DINOv2 官方模型列表](https://github.com/facebookresearch/dinov2#pretrained-models)和 [Cutie v1.0 发布页](https://github.com/hkchengrex/Cutie/releases/tag/v1.0)下载：
 
 ```bash
-[data]$ tar -zxvf grasp_demo_example.tar.gz && rm -rf grasp_demo_example.tar.gz
+mkdir -p weights/dinov2 weights/tracking
+curl -fL --retry 3 -o weights/dinov2/dinov2_vitb14_pretrain.pth \
+  https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth
+curl -fL --retry 3 -o weights/tracking/cutie-base-mega.pth \
+  https://github.com/hkchengrex/Cutie/releases/download/v1.0/cutie-base-mega.pth
 ```
 
-After decompression, you'll find the dataset organized in [Zarr format](https://zarr.readthedocs.io/en/stable/) with the following groups:
-
-### Dataset Structure
-
-#### `data` Group
-- **action**: $(K, 13)$ 
-  - Contains action data of right robotic arm and hand at each timestep, represented by 13 degrees of freedom (DoFs).
-- **right_state**: $(K, 13)$
-  - Contains state data of the right robotic arm and hand at each timestep, represented by 13 DoFs.
-- **rgbm**: $(K, H, W, 4)$
-  - Third-view images from the head camera with 4 channels, where the first 3 channels are RGB and the 4th channel is a binary mask.
-- **right_cam_img**: $(K, H, W, 3)$
-  - First-view images from the wrist camera with 3 RGB channels.
-
-#### `meta` Group
-- **episode_ends**: $(J,)$
-  - Marks the ending indices of each demonstration episode, used to segment different demonstration sequences.
-
-Here, $K$ represents the total number of samples and $J$ denotes the number of demonstration episodes. 
-
-## Launch Training
-
-To train the DexGraspVLA controller on a single GPU, run
-
-```
-python train.py --config-name train_dexgraspvla_controller_workspace
-```
-
-To train the DexGraspVLA controller on 8 GPUs, first configure [accelerate](https://huggingface.co/docs/accelerate/index) with `accelerate config`, where we enable BF16 mixed precision training, and then run `./train.sh` or 
-
-```
-accelerate launch --num_processes=8 train.py --config-name train_dexgraspvla_controller_workspace
-```
-
-Users can also start from an existing checkpoint by specifying `policy.start_ckpt_path` in `controller/config/train_dexgraspvla_controller_workspace.yaml`. To support application and fine-tuning, we provide an open-source, high-performing model checkpoint ([dexgraspvla-controller-20250320](https://drive.google.com/file/d/1ge1FYD2wUqBnFewWzpsjQ5v6pEDBraOH/view?usp=sharing)), which has been deployed and evaluated across five zero-shot locations at the time of release, demonstrating strong generalization capabilities. Additionally, other training settings can also be customized by modifying the configuration files in the `controller/config` folder.
-
-To help understand the internal model behaviors, we provide the functionality to generate, save, and visualize the attention maps of the controller. To enable this, please set `gen_attn_map` to `True` in the config file before training. During each sampling step, the attention maps will be saved as pickle files in the `train_sample_attn_maps` folder under the experiment directory. To visualize them, please run `python attention_map_visualizer.py --attn_maps_dir <path to train_sample_attn_maps>`. This will generate the images of attention maps under newly-created folders inside `train_sample_attn_maps` with the same names as the corresponding pickle files.
-
-
-
-# DexGraspVLA Planner
-
-
-We provide the code for the DexGraspVLA planner based on [Qwen2.5-VL-72B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-72B-Instruct) in the `planner` directory. Our interface currently supports calling the API or querying a deployed model on cloud servers.
-
-```python
-# Instantiate a planner that calls the API
-planner = DexGraspVLAPlanner(
-    api_key="your_api_key",
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    model_name="qwen2.5-vl-72b-instruct"
-)
-
-# Instantiate a planner that queries a deployed model
-planner = DexGraspVLAPlanner(
-    base_url="your_deployed_model_url"
-)
-```
-
-For deployment, we utilize an 8-A800 GPU server to host the Qwen2.5-VL-72B-Instruct model. The deployment is managed using vllm version 0.7.3, leveraging the Qwen2.5-VL-7B-Instruct model for speculative decoding. The deployment process utilizes four GPUs.
-
-The following command is used to deploy the model:
+当前代码默认使用上述两个本地路径。可用 SHA-256 核对下载文件：
 
 ```bash
-python -m vllm.entrypoints.openai.api_server --host 0.0.0.0 --port 8001 \
- --model <path to Qwen2.5-VL-72B-Instruct> --seed 42 -tp 1 \
- --speculative_model <path to Qwen2.5-VL-7B-Instruct> --num_speculative_tokens 5 \
- --gpu_memory_utilization 0.9 --tensor-parallel-size 4 --limit-mm-per-prompt "image=10"
+cat <<'SHA256' | sha256sum -c -
+0b8b82f85de91b424aded121c7e1dcc2b7bc6d0adeea651bf73a13307fad8c73  weights/dinov2/dinov2_vitb14_pretrain.pth
+9c05402ee36d3a356fb72715d263ba7e1ea06ad3bada48c1306491792da43023  weights/tracking/cutie-base-mega.pth
+SHA256
 ```
 
-
-
-# DexGraspVLA Inference
-
-The hardware platform we use for dexterous grasping is shown in the following figure.
-
-<div align="center"> <img src="./assets/hardware.jpg" width="400px" height="auto"/> </div>
-
-Due to intellectual property constraints, we are unable to open-source the hardware-related code. However, we have released the rest of the code for reference, and below, we provide instructions on how to run DexGraspVLA on this platform.
-
-## Installation
-
-First, install the required dependencies:
-
-```
-pip install pymodbus==2.5.3 pyrealsense2==2.55.1.6486
-```
-
-## Configuration
-
-### 1. Hardware Setup:
-Configure the hardware settings in `inference_utils/config.yaml`.
-
-### 2. Controller Checkpoint:
-Specify the trained controller model checkpoint in `controller/config/train_dexgraspvla_controller_workspace.yaml`.
-Alternatively, users can use our pre-trained checkpoint for quick deployment:
-[dexgraspvla-controller-20250320](https://drive.google.com/file/d/1ge1FYD2wUqBnFewWzpsjQ5v6pEDBraOH/view?usp=sharing).
-
-## Customizing the Inference Command
-Modify `inference.sh` by adjusting the following arguments based on users' needs:
-
-- `--manual`: Enables manual mode, allowing users to manually mark the bounding box, monitor the grasping process, and reset when necessary. If omitted, the full DexGraspVLA planner is used, leveraging a vision-language model (VLM) to plan and monitor the grasping trajectory autonomously.
-- `--save_deployment_data`: Saves rollout data from the inference episodes, including raw data and recorded videos.
-- `--gen_attn_map`: Generates and saves attention maps from the controller.
-
-## Running the Inference
-Once everything is set up, start the inference process with the following command:
+DINOv2 ViT-L/14 仅供切换其他模型配置时使用，可选下载并校验：
 
 ```bash
-./inference.sh
+curl -fL --retry 3 -o weights/dinov2/dinov2_vitl14_pretrain.pth \
+  https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth
+echo 'd5383ea8f4877b2472eb973e0fd72d557c7da5d3611bd527ceeb1d7162cbf428  weights/dinov2/dinov2_vitl14_pretrain.pth' | sha256sum -c -
 ```
 
-This command executes the configured grasping pipeline on the specified hardware platform.
+### 2. 从原始演示生成 Zarr
 
-During execution, detailed logs are generated and stored in the `logs` directory. These logs include:
+原始数据按 episode 分目录。每段至少需要 `proprio.hdf5` 和 `gripper.mp4`；生成 mask 后，每段还应有 `gripper.json` 和 `mask_gripper.mp4`：
 
-- **Pipeline status** – real-time updates on the grasping process
-- **Camera images** – captured frames from the execution
-- **Planner prompts & responses** – inputs and outputs from the vision-language model (VLM)
-- **Optional data** – attention maps and rollout data, if enabled
-
-
-
-# Citation
-
-If you find our project helpful, please consider citing it as
-
-```bibtex
-@misc{zhong2025dexgraspvla,
-      title={DexGraspVLA: A Vision-Language-Action Framework Towards General Dexterous Grasping}, 
-      author={Yifan Zhong and Xuchuan Huang and Ruochong Li and Ceyao Zhang and Zhang Chen and Tianrui Guan and Fanlian Zeng and Ka Num Lui and Yuyao Ye and Yitao Liang and Yaodong Yang and Yuanpei Chen},
-      year={2025},
-      eprint={2502.20900},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2502.20900}, 
-}
+```text
+data/org_data/0/
+├── episode_0/
+│   ├── proprio.hdf5
+│   ├── gripper.mp4
+│   ├── gripper.json
+│   └── mask_gripper.mp4
+├── episode_1/
+│   └── ...
+└── ...
 ```
 
+`proprio.hdf5` 包含关节动作、夹爪动作、关节状态、夹爪状态，以及各自时间戳和 `observations/images/cam_gripper_timestamp`。转换脚本以 `action/joint_action/timestamp` 为基准，在 50 ms 内最近邻对齐其他数据流；按 `assets/rm75/rm_75.urdf` 中的关节限位及夹爪 `[0,1]` 范围归一化，并保留参考数据的末尾夹爪动作裁剪规则。
 
-# Acknowledgements
+若原始 episode 已有有效的 `gripper.json`，可跳过首帧提取和标注回填。否则先提取首帧：
 
-This codebase is based on [Diffusion Policy](https://github.com/real-stanford/diffusion_policy), [RDT](https://github.com/thu-ml/RoboticsDiffusionTransformer), [DiT](https://github.com/facebookresearch/DiT), and [pi_zero_pytorch](https://github.com/lucidrains/pi-zero-pytorch/).
+```bash
+uv run --no-project --python .venv-rm75/bin/python scripts/rm75/extract_first_frames.py \
+  --src data/org_data/0 --dst data/org_data/0_first_frames
+```
+
+脚本会得到类似 `data/org_data/0_first_frames/episode_0/gripper.jpg` 的图片。用 Labelme 或能导出相同 JSON 格式的工具，在每张图片上标注**一个目标多边形**，保存为同目录的 `gripper.json`。标注读取器会忽略标签名包含 `plate` 的形状，并要求剩余形状恰好有一个有效目标多边形。
+
+复制标注前，可在图形桌面会话中分页检查图片和多边形。默认每页显示 4×4 张；`--rows` 和 `--cols` 可调整行列数。缺少图片或 JSON、空标注及无效多边形会在对应格子显示红色提示。按右键或下键查看下一页，左键或上键返回上一页，按 `q` 退出：
+
+```bash
+uv run --no-project --python .venv-rm75/bin/python \
+  scripts/rm75/view_gripper_annotations.py \
+  --src data/org_data/0_first_frames --rows 4 --cols 4
+```
+
+检查完成后，把标注复制回原始 episode：
+
+```bash
+uv run --no-project --python .venv-rm75/bin/python scripts/rm75/copy_json_back.py \
+  --src data/org_data/0_first_frames --dst data/org_data/0
+```
+
+然后用 Cutie 跟踪首帧目标，生成与 `gripper.mp4` 等帧数的 `mask_gripper.mp4`：
+
+```bash
+uv run --no-project --python .venv-rm75/bin/python scripts/rm75/video_extract_masks_gripper.py \
+  --src data/org_data/0 --weights weights/tracking/cutie-base-mega.pth --workers 1
+```
+
+已有 mask 默认跳过。需要重新生成时添加 `--overwrite`。整目录转换要求**每个**待处理 episode 都有可用 mask；当前 `data/org_data/0` 中有部分 episode 尚缺标注或 mask，需先补齐。可用下列命令列出缺失项：
+
+```bash
+for episode in data/org_data/0/episode_*; do
+  test -f "$episode/gripper.json" || echo "缺少标注: $episode"
+  test -f "$episode/mask_gripper.mp4" || echo "缺少 mask: $episode"
+done
+```
+
+最后转换为训练用 Zarr：
+
+```bash
+uv run --no-project --python .venv-rm75/bin/python scripts/rm75/trans_hdf5_to_zarr_gripper.py \
+  --src data/org_data/0 --dst data/gripper_zarr --workers 4
+```
+
+转换结果包含 `data/gripper_zarr/data/{action,state,gripper_image_paths,mask_image_paths}` 和 `data/gripper_zarr/meta/episode_ends`。`action`、`state` 都是 8 维；视频解码帧默认保存在同级的 `data/gripper_frames/source_000/`，Zarr 中记录相对于 Zarr 目录的图像路径。移动数据时应一起保留 Zarr 和帧缓存。多个来源可在 `--src` 后连续列出，例如 `--src data/org_data/0 data/org_data/1`；不同来源的同名 episode 会进入不同的 `source_XXX` 子目录。
+
+转换时如缺少 mask、视频与时间戳帧数不一致、无有效对齐帧或数据为空，脚本会报错。已有非空输出默认不会覆盖；确认需要重建时才添加 `--overwrite`。也可通过 `--frames-cache-dir` 和 `--urdf` 指定其他帧缓存及 URDF 路径。
+
+用下面的检查确认 Zarr 及其图像路径可读取：
+
+```bash
+uv run --no-project --python .venv-rm75/bin/python python - <<'PY'
+from pathlib import Path
+import zarr
+
+dataset_path = Path("data/gripper_zarr")
+root = zarr.open(str(dataset_path), mode="r")
+frames = int(root["meta/episode_ends"][-1])
+assert frames > 0
+assert root["data/action"].shape == root["data/state"].shape == (frames, 8)
+for name in ("gripper_image_paths", "mask_image_paths"):
+    paths = root[f"data/{name}"]
+    assert len(paths) == frames
+    assert (dataset_path / str(paths[0])).is_file()
+print(f"数据可用：{len(root['meta/episode_ends'])} episodes，{frames} frames")
+PY
+```
+
+### 3. 配置与启动训练
+
+RM75 专用配置为 `controller/config/train_dexgraspvla_controller_workspace_rm75.yaml` 和 `controller/config/task/grasp_rm75.yaml`。`train_rm75.sh` 内部通过 `uv run` 使用 `.venv-rm75/`，默认单进程、BF16、训练及验证 batch size 4、4 个数据加载进程，训练 125 个 epoch；学习率为 `1e-4`。每轮保存 `latest.ckpt` 和按训练 loss 选出的最优 checkpoint。默认不开启验证集划分（`val_ratio: 0`），日志使用离线模式。
+
+`RM75_DATASET` 指向转换后的 Zarr；`RM75_DINO_WEIGHTS` 可覆盖默认权重路径。省略 `RM75_DINO_SOURCE` 时，PyTorch Hub 会获取 DINOv2 源码；离线训练时应把它设为本地 DINOv2 源码目录。
+
+```bash
+RM75_DATASET=data/gripper_zarr bash train_rm75.sh
+```
+
+如需直接使用 `uv` 启动，等价命令为：
+
+```bash
+RM75_DATASET=data/gripper_zarr XFORMERS_DISABLED=1 \
+  uv run --no-project --python .venv-rm75/bin/python accelerate launch \
+  --num_processes 1 --main_process_port 25000 train.py \
+  --config-name train_dexgraspvla_controller_workspace_rm75
+```
+
+启动脚本把后续参数原样交给 Hydra，例如调整 epoch、batch size、数据加载进程和验证集比例：
+
+```bash
+RM75_DATASET=data/gripper_zarr bash train_rm75.sh \
+  training.num_epochs=20 dataloader.batch_size=2 dataloader.num_workers=2 \
+  task.dataset.val_ratio=0.1 training.val_every=1
+```
+
+只有划出验证 episode 且执行验证轮次时才会产生 `val_loss`。多卡启动可设置 `RM75_NUM_PROCESSES` 和 `RM75_PORT`，例如两卡使用 `RM75_NUM_PROCESSES=2 RM75_PORT=25000`。训练产物默认写入 `data/outputs/<日期>/<运行名>/`。
+
+若读取参考项目生成的旧 Zarr，其中图像路径仍为旧机器上的绝对路径，可通过 `path_prefix_map` 映射到当前机器；新转换的数据无需设置：
+
+```bash
+RM75_DATASET=/path/to/old/gripper_zarr bash train_rm75.sh \
+  '++task.dataset.path_prefix_map={/old/image/root:/current/image/root}'
+```
+
+### 4. 短跑验收与测试
+
+先用一个已完成 mask 的数据集执行 1 个 epoch、最多 3 个训练 batch。该命令同时触发一次仅依赖观测的动作采样，并在指定输出目录保存 checkpoint；重复执行时请换一个输出目录：
+
+```bash
+RM75_DATASET=data/gripper_zarr bash train_rm75.sh \
+  hydra.run.dir=data/outputs/rm75_check \
+  training.num_epochs=1 training.max_train_steps=3 \
+  training.sample_every=1 training.checkpoint_every=1
+```
+
+训练退出后，检查最后一条训练 loss 为有限数、归一化器存在，并确认 `latest.ckpt` 能重新读取：
+
+```bash
+uv run --no-project --python .venv-rm75/bin/python python - <<'PY'
+from pathlib import Path
+import json
+import math
+import dill
+import torch
+
+run_dir = Path("data/outputs/rm75_check")
+records = [json.loads(line) for line in (run_dir / "logs.json.txt").read_text().splitlines()]
+assert records and math.isfinite(records[-1]["train_loss"])
+assert (run_dir / "normalizer.pkl").is_file()
+checkpoint = run_dir / "checkpoints/latest.ckpt"
+payload = torch.load(checkpoint, map_location="cpu", pickle_module=dill)
+assert "model" in payload["state_dicts"]
+print(f"训练正常：loss={records[-1]['train_loss']:.6f}，checkpoint={checkpoint}")
+PY
+```
+
+训练进程顺利完成 `sample_every=1` 的采样阶段，说明策略的 `predict_action(obs_dict)` 调用已执行。运行 RM75 专项测试，覆盖时间对齐、裁剪与归一化、路径映射、序列补齐、颜色通道、缺失文件、多来源重名和启动参数：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 XFORMERS_DISABLED=1 \
+  uv run --no-project --python .venv-rm75/bin/python -m pytest tests/test_rm75_pipeline.py -q
+```

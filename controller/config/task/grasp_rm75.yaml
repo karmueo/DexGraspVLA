@@ -1,0 +1,35 @@
+# RM75 单臂夹爪数据、形状与图像路径映射配置。
+name: grasp_rm75
+
+image_shape: [3, 518, 518]
+mask_image_shape: [4, 294, 518]
+dataset_paths:
+  - ${oc.env:RM75_DATASET,data/gripper_zarr}
+
+shape_meta: &shape_meta
+  obs:
+    rgbm:
+      shape: ${task.mask_image_shape}
+      type: rgbm
+      horizon: ${n_obs_steps}
+    right_state:
+      shape: [8]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [8]
+    horizon: ${n_action_steps}
+
+env_runner:
+  _target_: controller.env_runner.real_grasp_image_runner.RealGraspImageRunner
+
+dataset:
+  _target_: controller.dataset.mask_image_dataset_videos_rm75.MaskImageDataset
+  zarr_paths: ${task.dataset_paths}
+  horizon: ${n_action_steps}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0
+  output_size: [294, 518]
+  path_prefix_map: {}

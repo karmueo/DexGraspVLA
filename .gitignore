@@ -3,6 +3,12 @@ logs
 wandb
 outputs
 data
+.venv-rm75/
+.deps/
+weights/
+*.ckpt
+*.pth
+*.pt
 data_local
 .vscode
 _wandb
