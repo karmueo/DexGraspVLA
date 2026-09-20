@@ -1,7 +1,6 @@
 """根据首帧多边形标注，用 Cutie 为 RM75 夹爪视频生成逐帧目标 mask。"""
 
 import argparse
-import json
 import multiprocessing
 from pathlib import Path
 
@@ -12,24 +11,18 @@ from hydra import compose, initialize_config_dir
 from tqdm import tqdm
 
 
-def load_init_mask(json_path: Path, frame_shape: tuple[int, ...]) -> np.ndarray:
-    """读取 gripper.json 中唯一的非 plate 多边形并生成 0/1 mask。"""
-    with json_path.open(encoding="utf-8") as stream:
-        annotation = json.load(stream)
-    height, width = frame_shape[:2]
-    annotated_height = int(annotation.get("imageHeight", height))
-    annotated_width = int(annotation.get("imageWidth", width))
-    shapes = [shape for shape in annotation.get("shapes", []) if "plate" not in shape.get("label", "")]
-    if len(shapes) != 1 or len(shapes[0].get("points", [])) < 3:
-        raise ValueError(f"需要一个有效的目标多边形: {json_path}")
-    polygon = np.asarray(shapes[0]["points"], dtype=np.int32).reshape(-1, 1, 2)
-    mask = np.zeros((annotated_height, annotated_width), dtype=np.uint8)
-    cv2.fillPoly(mask, [polygon], color=1)
-    if mask.shape != (height, width):
-        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-    if not np.any(mask):
-        raise ValueError(f"目标多边形为空: {json_path}")
-    return mask
+try:
+    from .gripper_target_selection import (
+        TargetSelectionCancelled,
+        load_init_mask,
+        resolve_video_target,
+    )
+except ImportError:
+    from gripper_target_selection import (
+        TargetSelectionCancelled,
+        load_init_mask,
+        resolve_video_target,
+    )
 
 
 class Matting:
@@ -72,7 +65,12 @@ class Matting:
         return probability.argmax(dim=0).cpu().numpy().astype(np.uint8)
 
 
-def process_video(video_path: Path, matting: Matting, overwrite: bool = False) -> Path:
+def process_video(
+    video_path: Path,
+    matting: Matting,
+    overwrite: bool = False,
+    target_index: int | None = None,
+) -> Path:
     """生成与原视频等帧数的灰度 mask 视频，成功后替换临时文件。"""
     output_path = video_path.with_name("mask_gripper.mp4")
     if output_path.exists() and not overwrite:
@@ -93,7 +91,7 @@ def process_video(video_path: Path, matting: Matting, overwrite: bool = False) -
         frame_rate = capture.get(cv2.CAP_PROP_FPS)
         if frame_rate <= 0:
             raise ValueError(f"视频帧率无效: {video_path}")
-        matting.start_video(load_init_mask(annotation_path, first_frame.shape))
+        matting.start_video(load_init_mask(annotation_path, first_frame.shape, target_index))
         writer = cv2.VideoWriter(str(temporary_path), cv2.VideoWriter_fourcc(*"mp4v"), frame_rate, (width, height), isColor=False)
         if not writer.isOpened():
             raise RuntimeError(f"无法创建 mask 视频: {temporary_path}")
@@ -126,11 +124,16 @@ def process_video(video_path: Path, matting: Matting, overwrite: bool = False) -
         temporary_path.unlink(missing_ok=True)
 
 
-def _run_worker(task: tuple[Path, Path, int, bool]) -> Path:
+def _run_worker(task: tuple[Path, Path, int, bool, int]) -> Path:
     """在指定 GPU 上初始化 Cutie 并处理单段视频。"""
-    video_path, weights, gpu_id, overwrite = task
+    video_path, weights, gpu_id, overwrite, target_index = task
     torch.cuda.set_device(gpu_id)
-    return process_video(video_path, Matting(weights, torch.device(f"cuda:{gpu_id}")), overwrite)
+    return process_video(
+        video_path,
+        Matting(weights, torch.device(f"cuda:{gpu_id}")),
+        overwrite,
+        target_index,
+    )
 
 
 def main() -> None:
@@ -151,15 +154,32 @@ def main() -> None:
     videos = sorted({video for root in args.src for video in root.rglob("gripper.mp4")})
     if not videos:
         raise ValueError("未找到 gripper.mp4")
-    tasks = [(video, args.weights, index % torch.cuda.device_count(), args.overwrite)
-             for index, video in enumerate(videos) if args.overwrite or not video.with_name("mask_gripper.mp4").exists()]
-    if not tasks:
+    pending_videos = [
+        video
+        for video in videos
+        if args.overwrite or not video.with_name("mask_gripper.mp4").exists()
+    ]
+    if not pending_videos:
         print("所有 mask 视频均已存在")
         return
+    try:
+        target_indices = [resolve_video_target(video) for video in pending_videos]
+    except TargetSelectionCancelled as exc:
+        parser.exit(1, f"{exc}\n")
+    tasks = [
+        (
+            video,
+            args.weights,
+            index % torch.cuda.device_count(),
+            args.overwrite,
+            target_index,
+        )
+        for index, (video, target_index) in enumerate(zip(pending_videos, target_indices))
+    ]
     if args.workers == 1:
         matting = Matting(args.weights, torch.device("cuda:0"))
-        for video, _, _, overwrite in tqdm(tasks, desc="生成 mask"):
-            print(process_video(video, matting, overwrite))
+        for video, _, _, overwrite, target_index in tqdm(tasks, desc="生成 mask"):
+            print(process_video(video, matting, overwrite, target_index))
     else:
         with multiprocessing.get_context("spawn").Pool(args.workers) as pool:
             for output in tqdm(pool.imap(_run_worker, tasks), total=len(tasks), desc="生成 mask"):

@@ -1,7 +1,9 @@
 """验证 RM75 转换、路径迁移和观测编码的关键行为。"""
 
+import json
 import os
 import subprocess
+import tkinter as tk
 from pathlib import Path
 
 import cv2
@@ -19,6 +21,14 @@ from scripts.rm75.trans_hdf5_to_zarr_gripper import (
     find_first_gripper_loosen,
     minmax_normalize,
     trans_items,
+)
+from scripts.rm75.gripper_target_selection import (
+    TargetPolygon,
+    TargetSelectionCancelled,
+    find_target_at_point,
+    resolve_video_target,
+    select_target,
+    target_index_from_key,
 )
 from scripts.rm75.video_extract_masks_gripper import load_init_mask
 
@@ -70,6 +80,119 @@ def _make_episode(root: Path, color: tuple[int, int, int]) -> None:
         }
         for key, value in values.items():
             stream.create_dataset(key, data=value)
+
+
+def test_multi_target_mask_selection_and_hit_testing(tmp_path: Path) -> None:
+    """多目标按索引生成单个 mask，重叠点击优先选择面积较小者。"""
+    annotation = tmp_path / "gripper.json"
+    annotation.write_text(
+        json.dumps(
+            {
+                "imageWidth": 32,
+                "imageHeight": 32,
+                "shapes": [
+                    {
+                        "label": "large",
+                        "points": [[2, 2], [20, 2], [20, 20], [2, 20]],
+                    },
+                    {
+                        "label": "small",
+                        "points": [[5, 5], [10, 5], [10, 10], [5, 10]],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="需要先选择"):
+        load_init_mask(annotation, (32, 32, 3))
+    large_mask = load_init_mask(annotation, (32, 32, 3), 0)
+    small_mask = load_init_mask(annotation, (32, 32, 3), 1)
+    assert large_mask[15, 15] == 1 and small_mask[15, 15] == 0
+    assert small_mask[7, 7] == 1
+    for invalid_index in (-1, 2, True):
+        with pytest.raises(ValueError, match="索引超出范围"):
+            load_init_mask(annotation, (32, 32, 3), invalid_index)
+
+    targets = [
+        TargetPolygon("large", ((2, 2), (20, 2), (20, 20), (2, 20))),
+        TargetPolygon("small", ((5, 5), (10, 5), (10, 10), (5, 10))),
+    ]
+    assert find_target_at_point(targets, (7, 7)) == 1
+    assert find_target_at_point(targets, (15, 15)) == 0
+    assert find_target_at_point(targets, (30, 30)) is None
+
+
+@pytest.mark.parametrize(
+    ("character", "keysym", "target_count", "expected"),
+    [
+        ("1", "1", 9, 0),
+        ("9", "9", 9, 8),
+        ("", "KP_1", 9, 0),
+        ("", "KP_9", 9, 8),
+        ("0", "0", 9, None),
+        ("x", "x", 9, None),
+        ("3", "3", 2, None),
+        ("", "KP_3", 2, None),
+    ],
+)
+def test_target_index_from_number_key(
+    character: str, keysym: str, target_count: int, expected: int | None
+) -> None:
+    """主键盘和数字小键盘只选择 1–9 内存在的目标。"""
+    assert target_index_from_key(character, keysym, target_count) == expected
+
+
+def test_target_resolver_only_prompts_for_multiple_targets(tmp_path: Path) -> None:
+    """单目标自动通过，多目标调用选择器，取消时终止解析。"""
+    _make_episode(tmp_path, (40, 80, 120))
+    episode = tmp_path / "episode_0"
+    annotation = episode / "gripper.json"
+    first = {"label": "first", "points": [[2, 2], [12, 2], [12, 12], [2, 12]]}
+    second = {"label": "second", "points": [[18, 18], [28, 18], [28, 28], [18, 28]]}
+
+    annotation.write_text(json.dumps({"shapes": [first]}), encoding="utf-8")
+
+    def unexpected_selector(*_args: object) -> int:
+        pytest.fail("单目标不应调用选择器")
+
+    assert resolve_video_target(episode / "gripper.mp4", unexpected_selector) == 0
+
+    annotation.write_text(json.dumps({"shapes": [first, second]}), encoding="utf-8")
+    calls = []
+
+    def choose_second(
+        frame: np.ndarray,
+        targets: list[TargetPolygon],
+        annotated_size: tuple[int, int],
+        title: str,
+    ) -> int:
+        calls.append((frame.shape, len(targets), annotated_size, title))
+        return 1
+
+    assert resolve_video_target(episode / "gripper.mp4", choose_second) == 1
+    assert calls == [((32, 32, 3), 2, (32, 32), str(episode))]
+
+    def cancel(*_args: object) -> int:
+        raise TargetSelectionCancelled("cancelled")
+
+    with pytest.raises(TargetSelectionCancelled):
+        resolve_video_target(episode / "gripper.mp4", cancel)
+
+
+def test_target_selector_reports_missing_display(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tk 无法创建窗口时返回可理解的桌面会话错误。"""
+    def fail_to_open() -> object:
+        raise tk.TclError("no display")
+
+    monkeypatch.setattr(tk, "Tk", fail_to_open)
+    targets = [
+        TargetPolygon("one", ((0, 0), (10, 0), (10, 10))),
+        TargetPolygon("two", ((12, 12), (20, 12), (20, 20))),
+    ]
+    with pytest.raises(RuntimeError, match="桌面显示会话"):
+        select_target(np.zeros((32, 32, 3), np.uint8), targets, (32, 32), "episode_0")
 
 
 def test_frame_cache_refreshes_when_mask_video_changes(tmp_path: Path) -> None:
@@ -180,8 +303,8 @@ def test_encoder_uses_rgb_and_observation_only(monkeypatch: pytest.MonkeyPatch) 
     assert encoder.state_net[0].weight.grad is not None
 
 
-def test_multigpu_launcher_passes_hydra_arguments(tmp_path: Path) -> None:
-    """启动脚本用 uv 指定独立环境，并透传多卡及 Hydra 参数。"""
+def test_5090x2_launcher_passes_hydra_arguments(tmp_path: Path) -> None:
+    """双卡 5090 脚本用 uv 指定独立环境，并透传 Hydra 参数。"""
     fake_uv = tmp_path / "uv"
     fake_uv.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", encoding="utf-8")
     fake_uv.chmod(0o755)
@@ -189,15 +312,15 @@ def test_multigpu_launcher_passes_hydra_arguments(tmp_path: Path) -> None:
         **os.environ,
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "RM75_VENV": str(tmp_path),
-        "RM75_NUM_PROCESSES": "2",
         "RM75_PORT": "27000",
     }
-    result = subprocess.run(["bash", "train_rm75.sh", "training.num_epochs=1"],
+    result = subprocess.run(["bash", "train_rm75_5090x2.sh", "training.num_epochs=1"],
                             check=True, capture_output=True, text=True, env=env)
     arguments = result.stdout.splitlines()
-    assert arguments[:9] == [
+    assert arguments[:15] == [
         "run", "--no-project", "--python", str(tmp_path / "bin/python"),
-        "accelerate", "launch", "--num_processes", "2", "--main_process_port",
+        "accelerate", "launch", "--num_processes", "2", "--num_machines", "1",
+        "--mixed_precision", "bf16", "--dynamo_backend", "no", "--main_process_port",
     ]
-    assert arguments[9] == "27000"
+    assert arguments[15] == "27000"
     assert arguments[-1] == "training.num_epochs=1"

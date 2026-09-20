@@ -47,7 +47,7 @@ def test_discovery_pairs_and_natural_order(tmp_path: Path) -> None:
 
 
 def test_overlay_and_annotation_errors(tmp_path: Path) -> None:
-    """仅绘制非 plate 多边形，并在缺失、空标注和多目标时给出错误。"""
+    """仅绘制非 plate 多边形，并将多目标作为可选择提示。"""
     image_path = tmp_path / "gripper.png"
     json_path = tmp_path / "gripper.json"
     write_image(image_path)
@@ -63,8 +63,12 @@ def test_overlay_and_annotation_errors(tmp_path: Path) -> None:
 
     write_annotation(json_path, [])
     assert "数量为 0" in render_tile(item, (40, 40)).errors[0]
-    write_annotation(json_path, [polygon(), polygon()])
-    assert "数量为 2" in render_tile(item, (40, 40)).errors[0]
+    other = {"label": "other", "shape_type": "polygon",
+             "points": [[1, 1], [4, 1], [4, 4], [1, 4]]}
+    write_annotation(json_path, [polygon(), other])
+    result = render_tile(item, (40, 40))
+    assert not result.errors and "2 个候选目标" in result.notices[0]
+    assert result.image.getpixel((5, 5)) != (255, 255, 255)
     json_path.write_text("{invalid", encoding="utf-8")
     assert "无法读取标注" in render_tile(item, (40, 40)).errors[0]
     json_path.unlink()

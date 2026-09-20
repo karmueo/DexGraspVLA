@@ -97,8 +97,10 @@ def read_polygons(json_path: Path, image_size: tuple[int, int]) -> tuple[list[li
     targets = [shape for shape in shapes if isinstance(shape, dict)
                and isinstance(shape.get("label", ""), str)
                and "plate" not in shape.get("label", "")]
-    if len(targets) != 1:
-        errors.append(f"目标多边形数量为 {len(targets)}，应为 1")
+    if not targets:
+        errors.append("目标多边形数量为 0，至少应有 1 个")
+    elif len(targets) > 1:
+        notices.append(f"检测到 {len(targets)} 个候选目标，生成 mask 时需选择一个")
     if any(not isinstance(shape, dict) or not isinstance(shape.get("label", ""), str)
            for shape in shapes):
         errors.append("形状或标签格式错误")
