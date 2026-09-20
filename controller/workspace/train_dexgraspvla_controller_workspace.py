@@ -18,6 +18,7 @@ import random
 import tqdm
 import numpy as np
 import pickle
+from contextlib import nullcontext
 
 from controller.common.pytorch_util import dict_apply
 from controller.workspace.base_workspace import BaseWorkspace
@@ -29,6 +30,7 @@ from controller.common.json_logger import JsonLogger
 from controller.model.diffusion.ema_model import EMAModel
 from controller.model.common.lr_scheduler import get_scheduler
 from accelerate import Accelerator
+from accelerate.utils import InitProcessGroupKwargs
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 # %%
@@ -69,10 +71,13 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
         # Set GPU device before initializing accelerator
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
+        backend = os.environ.get('RM75_DISTRIBUTED_BACKEND')
+        kwargs_handlers = [InitProcessGroupKwargs(backend=backend)] if backend else []
         accelerator = Accelerator(
             log_with='wandb',
             mixed_precision='bf16',  # Enable BF16 mixed precision training
-            device_placement=True
+            device_placement=True,
+            kwargs_handlers=kwargs_handlers
         )
 
         if accelerator.is_main_process:
@@ -157,7 +162,7 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
         train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler = accelerator.prepare(
             train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler
         )
-        device = self.model.device
+        device = accelerator.device
         if self.ema_model is not None:
             self.ema_model.to(device)
 
@@ -175,7 +180,8 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        with JsonLogger(log_path) as json_logger:
+        logger_context = JsonLogger(log_path) if accelerator.is_main_process else nullcontext()
+        with logger_context as json_logger:
             for local_epoch_idx in range(cfg.training.num_epochs):
                 self.model.train()
 
@@ -225,7 +231,8 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
                             accelerator.log(step_log, step=self.global_step)
-                            json_logger.log(step_log)
+                            if accelerator.is_main_process:
+                                json_logger.log(step_log)
                             self.global_step += 1
 
                         if (cfg.training.max_train_steps is not None) \
@@ -234,7 +241,8 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
 
                 # at the end of each epoch
                 # replace train_loss with epoch average
-                train_loss = np.mean(train_losses)
+                train_loss = torch.tensor(np.mean(train_losses), device=device)
+                train_loss = accelerator.reduce(train_loss, reduction='mean').item()
                 step_log['train_loss'] = train_loss
 
                 # ========= eval for this epoch ==========
@@ -353,7 +361,8 @@ class TrainDexGraspVLAControllerWorkspace(BaseWorkspace):
                 # end of epoch
                 # log of last step is combined with validation and rollout
                 accelerator.log(step_log, step=self.global_step)
-                json_logger.log(step_log)
+                if accelerator.is_main_process:
+                    json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
 

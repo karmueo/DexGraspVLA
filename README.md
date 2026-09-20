@@ -131,7 +131,7 @@ PY
 
 ### 3. 配置与启动训练
 
-RM75 专用配置为 `controller/config/train_dexgraspvla_controller_workspace_rm75.yaml` 和 `controller/config/task/grasp_rm75.yaml`。`train_rm75.sh` 内部通过 `uv run` 使用 `.venv-rm75/`，默认单进程、BF16、训练及验证 batch size 4、4 个数据加载进程，训练 125 个 epoch；学习率为 `1e-4`。每轮保存 `latest.ckpt` 和按训练 loss 选出的最优 checkpoint。默认不开启验证集划分（`val_ratio: 0`），日志使用离线模式。
+RM75 专用配置为 `controller/config/train_dexgraspvla_controller_workspace_rm75.yaml` 和 `controller/config/task/grasp_rm75.yaml`。`train_rm75.sh` 内部通过 `uv run` 使用 `.venv-rm75/`，默认单进程、BF16、训练 batch size 16、验证 batch size 4、各 4 个数据加载进程，训练 50 个 epoch；学习率为 `1e-4`。每轮保存 `latest.ckpt` 和按训练 loss 选出的最优 checkpoint。默认不开启验证集划分（`val_ratio: 0`），日志使用离线模式。
 
 `RM75_DATASET` 指向转换后的 Zarr；`RM75_DINO_WEIGHTS` 可覆盖默认权重路径。省略 `RM75_DINO_SOURCE` 时，PyTorch Hub 会获取 DINOv2 源码；离线训练时应把它设为本地 DINOv2 源码目录。
 
@@ -156,7 +156,21 @@ RM75_DATASET=data/gripper_zarr bash train_rm75.sh \
   task.dataset.val_ratio=0.1 training.val_every=1
 ```
 
-只有划出验证 episode 且执行验证轮次时才会产生 `val_loss`。多卡启动可设置 `RM75_NUM_PROCESSES` 和 `RM75_PORT`，例如两卡使用 `RM75_NUM_PROCESSES=2 RM75_PORT=25000`。训练产物默认写入 `data/outputs/<日期>/<运行名>/`。
+只有划出验证 episode 且执行验证轮次时才会产生 `val_loss`。多卡启动可设置 `RM75_NUM_PROCESSES` 和 `RM75_PORT`，例如两卡使用 `RM75_NUM_PROCESSES=2 RM75_PORT=25000`。`dataloader.batch_size` 是每卡的 batch size。训练产物默认写入 `data/outputs/<日期>/<运行名>/`。
+
+两张 RTX 5090 的 NCCL 实测配置如下。当前环境将 `NCCL_NTHREADS` 设为 `256` 可避免训练时的 CUDA 非法内存访问。每卡 batch 64、全局 batch 128，已完成五轮训练并每轮验证：
+
+```bash
+NCCL_NTHREADS=256 NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=4 \
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+RM75_DATASET=data/gripper_zarr RM75_DINO_SOURCE=.deps/dinov2 \
+RM75_NUM_PROCESSES=2 RM75_DISTRIBUTED_BACKEND=nccl bash train_rm75.sh \
+  training.num_epochs=5 dataloader.batch_size=64 dataloader.num_workers=2 \
+  val_dataloader.num_workers=2 task.dataset.val_ratio=0.1 training.val_every=1 \
+  training.lr_scheduler=constant_with_warmup training.lr_warmup_steps=100
+```
+
+这套配置的第五轮 `train_loss` 为 0.02407，`val_loss` 为 0.02699，训练过程中未出现 CUDA 非法内存访问。
 
 若读取参考项目生成的旧 Zarr，其中图像路径仍为旧机器上的绝对路径，可通过 `path_prefix_map` 映射到当前机器；新转换的数据无需设置：
 

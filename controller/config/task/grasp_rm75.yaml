@@ -2,7 +2,8 @@
 name: grasp_rm75
 
 image_shape: [3, 518, 518]
-mask_image_shape: [4, 294, 518]
+mask_image_shape: [4, 392, 518]
+# mask_image_shape: [4, 294, 518]
 dataset_paths:
   - ${oc.env:RM75_DATASET,data/gripper_zarr}
 
@@ -31,5 +32,6 @@ dataset:
   pad_after: ${eval:'${n_action_steps}-1'}
   seed: 42
   val_ratio: 0
-  output_size: [294, 518]
+  output_size: [392, 518]
+  # output_size: [294, 518]
   path_prefix_map: {}
