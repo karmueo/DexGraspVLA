@@ -143,6 +143,19 @@ class MaskImageDataset(BaseImageDataset):
             images.append(img)
         return np.array(images)
 
+    def _load_mask_images_from_paths(self, image_paths, zarr_root):
+        """只解码模型实际使用的 mask 通道，并保持原 B 通道语义。"""
+        images = []
+        for path_str in image_paths:
+            full_path = self._resolve_image_path(path_str, zarr_root)
+            with Image.open(full_path) as opened:
+                if opened.mode == "L":
+                    img = np.array(opened)
+                else:
+                    img = np.array(opened.convert("RGB").getchannel("B"))
+            images.append(img)
+        return np.stack(images, axis=0)[..., None]
+
     def _process_mask_image_batch(self, rgb_images, mask_images):
         """复现参考数据集的图像缩放、mask 阈值和最终插值。"""
         rgb = torch.from_numpy(rgb_images).float().permute(0, 3, 1, 2)
@@ -162,12 +175,13 @@ class MaskImageDataset(BaseImageDataset):
         mask = (mask > 200).float()
 
         combined = torch.cat([rgb, mask], dim=1)
-        combined = F.interpolate(
-            combined,
-            size=self.output_size,
-            mode="bilinear",
-            align_corners=False,
-        )
+        if combined.shape[-2:] != self.output_size:
+            combined = F.interpolate(
+                combined,
+                size=self.output_size,
+                mode="bilinear",
+                align_corners=False,
+            )
         return combined.numpy()
 
     def _sample_to_data(self, sample, zarr_root):
@@ -178,10 +192,9 @@ class MaskImageDataset(BaseImageDataset):
         gripper_images = self._load_images_from_paths(
             sample["gripper_image_paths"][t_slice], zarr_root
         )
-        mask_images = self._load_images_from_paths(
+        mask_images = self._load_mask_images_from_paths(
             sample["mask_image_paths"][t_slice], zarr_root
         )
-        mask_images = mask_images[:, :, :, :1]
 
         mask_processed_frames = self._process_mask_image_batch(
             gripper_images, mask_images

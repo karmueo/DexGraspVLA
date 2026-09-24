@@ -21,20 +21,21 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 
 exec uv run --no-project --python "${venv_path}/bin/python" accelerate launch \
+    --multi_gpu \
     --num_processes 2 --num_machines 1 \
     --mixed_precision bf16 --dynamo_backend no \
     --main_process_port "${port}" \
     "${repo_root}/train.py" --config-name train_dexgraspvla_controller_workspace_rm75 \
-    training.num_epochs=20 \
+    training.num_epochs=120 \
     optimizer.lr=1e-4 \
     dataloader.batch_size=64 \
-    dataloader.num_workers=2 \
+    dataloader.num_workers=8 \
     val_dataloader.batch_size=16 \
-    val_dataloader.num_workers=2 \
+    val_dataloader.num_workers=8 \
     task.dataset.val_ratio=0.1 \
-    training.val_every=2 \
+    training.val_every=10 \
     training.sample_every=2 \
-    training.checkpoint_every=1 \
+    training.checkpoint_every=10 \
     training.lr_scheduler=constant_with_warmup \
     training.lr_warmup_steps=500 \
     "$@"

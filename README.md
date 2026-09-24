@@ -492,6 +492,50 @@ RM75_DATASET=/path/to/old/gripper_zarr ./train_rm75_5090.sh \
 | `++task.dataset.path_prefix_map` | 新增或强制覆盖 Hydra 映射字典 |
 | 输出 | 正常训练产物 |
 
+#### 3.8 训练中断后从 checkpoint 继续训练
+
+训练产物默认位于 `data/outputs/<日期>/<运行名>/`，在配置文件训练配置文件比如`controller/config/train_dexgraspvla_controller_workspace_rm75.yaml`中的`hydra.run.dir:`中配置。其中
+`checkpoints/latest.ckpt` 是最近一次按 `training.checkpoint_every` 保存的 checkpoint，
+`epoch_checkpoints/` 则保存配置中指定轮次的额外 checkpoint。中断发生在两次保存之间时，
+未写入 checkpoint 的训练进度无法恢复。
+
+先确定原训练目录并检查 checkpoint：
+
+```bash
+RUN_DIR=data/outputs/<日期>/<运行名>
+ls -lh "${RUN_DIR}/checkpoints/latest.ckpt"
+tail -n 5 "${RUN_DIR}/logs.json.txt"
+```
+
+使用双卡脚本从已有模型权重继续优化：
+
+```bash
+RUN_DIR=data/outputs/<日期>/<运行名>
+CKPT="$(pwd)/${RUN_DIR}/checkpoints/latest.ckpt"
+
+RM75_DATASET=data/gripper_zarr ./train_rm75_5090x2.sh \
+  policy.start_ckpt_path="${CKPT}" \
+  training.num_epochs=<继续训练的轮数>
+```
+
+单卡恢复时将 `train_rm75_5090x2.sh` 换成 `train_rm75_5090.sh`。恢复时应继续使用与原训练一致的
+数据集、模型配置和主要训练参数。`training.num_epochs` 表示本次启动后额外执行的轮数；例如最近的
+checkpoint 完成了约 21 轮，而目标总轮数为 120，可设置 `training.num_epochs=99`。新日志和
+checkpoint 会写入本次启动自动创建的新运行目录，不会覆盖原训练目录。
+
+当前实现属于“加载模型权重后继续训练”，不是完整的断点恢复：checkpoint 不包含优化器和学习率
+调度器状态，加载后 `epoch`、`global_step` 也会从零开始，因此 warmup 和日志计数会重新开始，且
+无法恢复到中断时的精确 batch。不要仅添加 `training.resume=True` 期待完整恢复；当前加载顺序尚不
+支持可靠恢复全部训练状态。
+
+| 参数/项目 | 输入/输出及含义 |
+| --- | --- |
+| `policy.start_ckpt_path` | 输入已有 `.ckpt`；建议使用绝对路径 |
+| `training.num_epochs` | 本次恢复启动后额外训练的轮数 |
+| `training.checkpoint_every` | checkpoint 保存间隔；间隔越大，中断时可能丢失的进度越多 |
+| 输出 | 新运行目录中的日志、归一化器和 checkpoint |
+| 未恢复状态 | optimizer、学习率调度器、精确 epoch/global step 和 batch 位置 |
+
 ### 4. 短跑验收与测试
 
 #### 4.1 执行三步短跑
